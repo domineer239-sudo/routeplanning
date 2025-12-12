@@ -15,14 +15,16 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. Config
 # ==========================================
-TARGET_DIR = r"D:\202509的课件\ai作业"
-TARGET_LOCATION = (5.4195, 100.3325) 
-SEARCH_RADIUS = 1200 
+# Target directory for output files (Adjust this path as needed)
+TARGET_DIR = r"D:\202509的课件\ai作业" 
+TARGET_LOCATION = (5.4195, 100.3325) # Location near Georgetown, Penang
+SEARCH_RADIUS = 1200 # Radius in meters
 
 # ==========================================
 # 2. Helpers
 # ==========================================
 def get_bearing(lat1, lon1, lat2, lon2):
+    """Calculates the initial bearing between two GPS coordinates."""
     lat1 = math.radians(lat1); lat2 = math.radians(lat2)
     dLon = math.radians(lon2 - lon1)
     y = math.sin(dLon) * math.cos(lat2)
@@ -31,11 +33,13 @@ def get_bearing(lat1, lon1, lat2, lon2):
     return (math.degrees(brng) + 360) % 360
 
 def clean_attribute(val, default_val):
+    """Cleans up list-based or missing OSM attributes."""
     if isinstance(val, list): return val[0] 
     if pd.isna(val) or val is None: return default_val
     return val
 
 def categorize_road(osm_type):
+    """Categorizes OSM highway types into simplified classes."""
     t = str(osm_type)
     if 'motorway' in t or 'trunk' in t: return "Highway"
     if 'primary' in t: return "Main_Artery"
@@ -45,6 +49,7 @@ def categorize_road(osm_type):
     return "Small_Alley"
 
 def generate_fake_timestamp(scenario):
+    """Generates a plausible timestamp based on the traffic scenario."""
     now = datetime.datetime.now()
     date_str = now.strftime("%Y-%m-%d")
     if scenario == "Morning_Peak": h = random.randint(7, 9)
@@ -57,8 +62,10 @@ def generate_fake_timestamp(scenario):
 # 3. Traffic Logic
 # ==========================================
 def apply_traffic_conditions(G, time_label):
+    """Applies simulated congestion and penalties to the graph edges."""
     all_edges = list(G.edges(data=True))
     
+    # Configure congestion based on scenario
     if time_label == "Morning_Peak":
         congestion_rate = 0.20; primary_weight = 90
     elif time_label == "Evening_Peak":
@@ -66,6 +73,7 @@ def apply_traffic_conditions(G, time_label):
     else: 
         congestion_rate = 0.05; primary_weight = 10
 
+    # Determine edge weights for obstacle selection (prioritize major roads for blocking)
     weights = []
     for u, v, data in all_edges:
         hw_type = str(clean_attribute(data.get('highway'), 'unclassified'))
@@ -74,7 +82,8 @@ def apply_traffic_conditions(G, time_label):
         elif 'tertiary' in hw_type: w = 30
         else: w = 5
         weights.append(w)
-        
+            
+    # Select which roads are "congested" (obstacles)
     num_obstacles = int(len(all_edges) * congestion_rate)
     obstacle_keys = set()
     if num_obstacles > 0:
@@ -82,17 +91,18 @@ def apply_traffic_conditions(G, time_label):
         obstacle_edges = [all_edges[i] for i in list(set(selected_indices))[:num_obstacles]]
         obstacle_keys = set([(u, v) for u, v, d in obstacle_edges])
 
+    # Assign traffic status and shortest-path weight
     for u, v, data in G.edges(data=True):
-        # Add basic info for Dataset 1
         data['time_scenario'] = time_label 
         if (u, v) in obstacle_keys:
             data['traffic_status'] = "Congested"
             data['is_obstacle'] = 1     
-            data['weight'] = 9999999    
+            data['weight'] = 9999999    # Heavy penalty forces pathfinder to avoid this road
         else:
             data['traffic_status'] = "Clear"
             data['is_obstacle'] = 0
-            data['weight'] = data.get('travel_time', data['length'])
+            # Weight is the travel time (seconds) for clear roads
+            data['weight'] = data.get('travel_time', data['length']) 
             
     return G
 
@@ -101,8 +111,8 @@ def apply_traffic_conditions(G, time_label):
 # ==========================================
 def generate_all_datasets(G_base):
     print("📊 Generating Datasets...")
-    training_data = [] # Dataset B
-    map_status_data = [] # Dataset A
+    training_data = [] # Dataset B (ML Training)
+    map_status_data = [] # Dataset A (Map Status)
     
     scenarios = ["Morning_Peak", "Off_Peak", "Evening_Peak"]
     
@@ -110,9 +120,8 @@ def generate_all_datasets(G_base):
         G_scenario = G_base.copy()
         G_scenario = apply_traffic_conditions(G_scenario, time_period)
         
-        # --- [NEW] Collect Dataset A: Map Status ---
-        # Record the state of EVERY road in this scenario
-        print(f"   -> Snapshotting Map Status for {time_period}...")
+        # --- [Dataset A] Collect Map Status ---
+        print(f"   -> Snapshotting Map Status for {time_period}...")
         for u, v, d in G_scenario.edges(data=True):
             raw_type = str(clean_attribute(d.get('highway'), 'unclassified'))
             map_status_data.append({
@@ -120,60 +129,69 @@ def generate_all_datasets(G_base):
                 "Road_ID": f"{u}-{v}",
                 "Road_Name": clean_attribute(d.get('name'), "Unnamed"),
                 "Road_Type": categorize_road(raw_type),
-                "Status": d['traffic_status'], # Clear/Congested
+                "Status": d['traffic_status'], 
                 "Is_Blocked": d['is_obstacle'],
                 "Length": float(f"{d['length']:.1f}")
             })
 
-        # --- Collect Dataset B: Training Data ---
+        # --- [Dataset B] Collect Training Data ---
         nodes = list(G_scenario.nodes())
-        print(f"   -> Simulating Trips for {time_period}...")
+        print(f"   -> Simulating Trips for {time_period}...")
         
+        # Function to extract a single row for the training dataset
+        def extract_row(u, v, d, label):
+            raw_type = str(clean_attribute(d.get('highway'), 'unclassified'))
+            distance_m = d['length']
+            
+            # Use the original travel_time calculated by OSMPnx
+            time_taken_sec = d.get('travel_time', distance_m / (40 / 3.6)) 
+            
+            # Calculate average speed (Distance / Time)
+            avg_speed_kph = (distance_m / time_taken_sec) * 3.6 
+            
+            return {
+                "timestamp": generate_fake_timestamp(time_period),
+                # Removed "start" and "end" to simplify the dataset
+                "distance": float(f"{distance_m:.1f}"),
+                "intersection": G_scenario.degree[u],
+                "traffic": d['traffic_status'],
+                "obstacle": int(d['is_obstacle']),
+                "time_taken": float(f"{time_taken_sec:.2f}"), # Time (time taken)
+                "score": float(f"{d['weight']:.2f}"),
+                "is_chosen": label,
+                "avg_speed": float(f"{avg_speed_kph:.1f}"),   # Speed (average speed)
+                "Road_type": categorize_road(raw_type),
+                "One_way": "Yes" if d.get('oneway') else "No"
+            }
+
+        # Simulate trips and generate YES/NO choices
         for i in range(150): 
             start, end = random.sample(nodes, 2)
             try:
-                end_node_data = G_scenario.nodes[end]
+                # Find the optimal path based on 'weight' (which avoids congestion)
                 path = nx.shortest_path(G_scenario, start, end, weight='weight')
                 path_edges = set(zip(path[:-1], path[1:]))
                 
-                def extract_row(u, v, d, label):
-                    raw_type = str(clean_attribute(d.get('highway'), 'unclassified'))
-                    road_bearing = d.get('bearing', 0)
-                    u_node = G_scenario.nodes[u]
-                    target_bearing = get_bearing(u_node['y'], u_node['x'], end_node_data['y'], end_node_data['x'])
-                    angle_diff = abs(road_bearing - target_bearing)
-                    if angle_diff > 180: angle_diff = 360 - angle_diff
-
-                    return {
-                        "timestamp": generate_fake_timestamp(time_period),
-                        "start": u, "end": v,
-                        "distance": float(f"{d['length']:.1f}"),
-                        "intersection": G_scenario.degree[u],
-                        "traffic": d['traffic_status'],
-                        "obstacle": int(d['is_obstacle']),
-                        "time": time_period,
-                        "score": float(f"{d['weight']:.2f}"),
-                        "is_chosen": label,
-                        "Speed": float(clean_attribute(d.get('maxspeed'), 40)),
-                        "Road_type": categorize_road(raw_type),
-                        "One_way": "Yes" if d.get('oneway') else "No"
-                    }
-
+                # Positive Examples (Chosen)
                 for u, v in path_edges:
                     d = G_scenario.get_edge_data(u, v)[0]
+                    # Pass 'end' to extract_row if needed, but not strictly required here
                     training_data.append(extract_row(u, v, d, "YES"))
                 
+                # Negative Examples (Not Chosen)
+                # Sample 3 random edges not on the path
                 sample_neg = random.sample(list(G_scenario.edges()), 3)
                 for u, v in sample_neg:
                     if (u, v) not in path_edges:
                         d = G_scenario.get_edge_data(u, v)[0]
+                        # Pass 'end' to extract_row if needed
                         training_data.append(extract_row(u, v, d, "NO"))
             except nx.NetworkXNoPath: continue
                 
     return training_data, map_status_data
 
 # ==========================================
-# 5. Interactive Map Logic
+# 5. Interactive Map Logic (No changes needed here)
 # ==========================================
 class InteractiveRoutePlanner:
     def __init__(self, G, time_label):
@@ -186,12 +204,12 @@ class InteractiveRoutePlanner:
         self.text_start = None; self.text_end = None
         self.route_lines = [] 
         
-        print("   -> Rendering map...")
+        print("   -> Rendering map...")
         edge_colors = []
         edge_widths = []
         for u, v, d in G.edges(data=True):
             if d.get('is_obstacle') == 1:
-                edge_colors.append('#FF0000'); edge_widths.append(2.0)
+                edge_colors.append('#FF0000'); edge_widths.append(2.0) # Red for Congested
             else:
                 hw_type = str(clean_attribute(d.get('highway'), ''))
                 if 'motorway' in hw_type or 'trunk' in hw_type:
@@ -219,7 +237,7 @@ class InteractiveRoutePlanner:
         plt.show()
 
     def on_xlim_changed(self, ax):
-        pass # Simplified for stability
+        pass
 
     def reset_selection(self):
         self.start_node = None; self.end_node = None
@@ -255,15 +273,16 @@ class InteractiveRoutePlanner:
 
     def calculate_route(self):
         try:
+            # Shortest path is based on 'weight' which avoids blocked roads
             route = nx.shortest_path(self.G, self.start_node, self.end_node, weight='weight')
+            # Plot the route on the map
             ox.plot_graph_route(self.G, route, route_color='blue', route_linewidth=4, ax=self.ax, show=False)
             
-            # Capture route lines
+            # Capture route lines for reset
             current_collections = self.ax.collections[-1:]
             self.route_lines.extend(current_collections)
 
-            # Snapshots
-            for txt in self.landmark_labels: txt.set_visible(False)
+            # Save a snapshot of the route
             path_overview = os.path.join(TARGET_DIR, f"route_overview_{self.time_label}.png")
             self.fig.savefig(path_overview, dpi=300, bbox_inches='tight')
             print(f"📸 Saved Overview: {path_overview}")
@@ -277,7 +296,7 @@ class InteractiveRoutePlanner:
         except Exception as e: print(f"Error: {e}")
 
 # ==========================================
-# 6. GUI Launcher
+# 6. GUI Launcher and Main Execution
 # ==========================================
 def start_launcher_gui(G_base):
     root = tk.Tk()
@@ -296,7 +315,8 @@ def start_launcher_gui(G_base):
         time_label = time_var.get()
         print(f"\n🚀 Launching Interactive Map for [{time_label}]...")
         G_sim = G_base.copy()
-        G_sim = apply_traffic_conditions(G_sim, time_label)
+        # Apply traffic for the selected scenario
+        G_sim = apply_traffic_conditions(G_sim, time_label) 
         root.destroy()
         InteractiveRoutePlanner(G_sim, time_label)
 
@@ -309,16 +329,20 @@ def main():
         try: os.makedirs(TARGET_DIR)
         except: pass
 
-    print(f"⬇️  Initializing Map...")
-    cf = '["highway"!~"motorway|trunk|motorway_link|trunk_link"]'
+    print(f"⬇️  Initializing Map...")
+    # Exclude major highways for a local network focus
+    cf = '["highway"!~"motorway|trunk|motorway_link|trunk_link"]' 
     G = ox.graph_from_point(TARGET_LOCATION, dist=SEARCH_RADIUS, custom_filter=cf, network_type='drive')
     
     G = ox.add_edge_bearings(G) 
     G = ox.add_edge_speeds(G, fallback=40) 
+    # Ensure attributes exist before calculating travel time
     for u, v, d in G.edges(data=True):
         if 'speed_kph' not in d or pd.isna(d['speed_kph']): d['speed_kph'] = 40.0
         if 'length' not in d or pd.isna(d['length']): d['length'] = 50.0
-    G = ox.add_edge_travel_times(G)
+    G = ox.add_edge_travel_times(G) # This calculates 'travel_time' (seconds)
+    
+    # Keep only the largest connected component for reliable pathfinding
     largest_cc = max(nx.strongly_connected_components(G), key=len)
     G_base = G.subgraph(largest_cc).copy()
     print("✅ Map Ready.")
@@ -326,22 +350,26 @@ def main():
     # --- Generate BOTH Datasets ---
     training_data, map_status_data = generate_all_datasets(G_base)
     
-    # 1. Save Training Data (For Weka)
+    # 1. Save Training Data (Dataset B)
     csv_train = os.path.join(TARGET_DIR, "penang_training_data.csv")
     df_train = pd.DataFrame(training_data)
-    cols = ["timestamp", "start", "end", "distance", "intersection", "traffic", 
-            "obstacle", "time", "score", "is_chosen", "Speed", "Road_type", "One_way"]
+    
+    # FINAL COLUMN LIST matching your request:
+    cols = ["timestamp", "distance", "intersection", "traffic", 
+            "obstacle", "time_taken", "score", "is_chosen", 
+            "avg_speed", "Road_type", "One_way"]
+            
     df_train = df_train[cols]
     df_train.to_csv(csv_train, index=False)
     print(f"✅ Saved Training Data (Dataset B): {csv_train}")
 
-    # 2. Save Map Status Data (For Documentation/Environment Description)
+    # 2. Save Map Status Data (Dataset A)
     csv_status = os.path.join(TARGET_DIR, "penang_map_status.csv")
     df_status = pd.DataFrame(map_status_data)
     df_status.to_csv(csv_status, index=False)
     print(f"✅ Saved Map Status Data (Dataset A): {csv_status}")
     
-    print("🖥️  Starting GUI...")
+    print("🖥️  Starting GUI...")
     start_launcher_gui(G_base)
 
 if __name__ == "__main__":
